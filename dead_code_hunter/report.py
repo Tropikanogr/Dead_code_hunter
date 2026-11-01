@@ -65,6 +65,7 @@ def build_report(
     root: Path,
     langs: list[str],
     scope_paths: list[str],
+    scope_detail: dict[str, Any] | None = None,
     projects: list[dict[str, Any]],
     coverage: list[dict[str, Any]],
     findings: list[Finding],
@@ -84,7 +85,11 @@ def build_report(
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "repository": {"path": str(root), "repo_id": repo_id(root)},
         "revision": git.get("revision", {}),
-        "scope": {"paths": scope_paths or ["."], "langs": langs},
+        "scope": {
+            "paths": scope_paths or ["."],
+            "langs": langs,
+            **(scope_detail or {}),
+        },
         "projects": projects,
         "coverage": coverage,
         "isolation": isolation,
@@ -167,6 +172,21 @@ def render_markdown(data: dict[str, Any]) -> str:
     lines.append(
         f"Revision: `{revision.get('head') or 'unknown'}` (dirty: {revision.get('dirty')})"
     )
+    scope = data.get("scope", {})
+    if scope.get("requested"):
+        lines.append("")
+        lines.append(f"Scope: {', '.join(f'`{item}`' for item in scope['requested'])}")
+        if scope.get("unmatched"):
+            lines.append(
+                "> Unmatched scope: "
+                + ", ".join(f"`{item}`" for item in scope["unmatched"])
+                + " — the scan is incomplete, never clean."
+            )
+        if scope.get("outside_root"):
+            lines.append(
+                "> Rejected scope outside the repository: "
+                + ", ".join(f"`{item}`" for item in scope["outside_root"])
+            )
     lines.append("")
     lines.append(
         "> A CANDIDATE is a strong candidate for human review. It is never proof that code is safe to delete."

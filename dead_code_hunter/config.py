@@ -16,8 +16,7 @@ from typing import Any
 
 from .models import Finding, Impact, normalize_path
 
-DEFAULT_CRITICAL_TERMS: tuple[str, ...] = (
-    "billing", "invoice", "vat", "fpa", "payment", "cash", "cod", "settlement",
+DEFAULT_CRITICAL_TERMS: tuple[str, ...] = (    "billing", "invoice", "vat", "fpa", "payment", "cash", "cod", "settlement",
     "auth", "oauth", "mydata", "aade", "timologio", "parastatiko", "ekkatharisi",
 )
 DEFAULT_HIGH_TERMS: tuple[str, ...] = (
@@ -27,6 +26,8 @@ DEFAULT_HIGH_TERMS: tuple[str, ...] = (
 
 MAX_TIMEOUT = 900
 MAX_PROJECTS = 500
+DEFAULT_MAX_FILES = 200_000
+MAX_FILE_LIMIT = 2_000_000
 
 
 @dataclass
@@ -70,6 +71,7 @@ class ScannerConfig:
     impact: ImpactPolicy = field(default_factory=ImpactPolicy)
     timeout_seconds: int = 180
     max_projects: int = 64
+    max_files: int = DEFAULT_MAX_FILES
     unknown_keys: list[str] = field(default_factory=list)
     parse_error: str | None = None
     source: str | None = None
@@ -79,6 +81,7 @@ class ScannerConfig:
             "impact": self.impact.to_dict(),
             "timeout_seconds": self.timeout_seconds,
             "max_projects": self.max_projects,
+            "max_files": self.max_files,
             "unknown_keys": self.unknown_keys,
             "parse_error": self.parse_error,
             "source": self.source,
@@ -129,8 +132,13 @@ def load_config(root: Path) -> ScannerConfig:
             config.max_projects = max(1, min(MAX_PROJECTS, max_projects))
         elif max_projects is not None:
             config.unknown_keys.append("scan.max_projects (invalid type)")
+        max_files = scan.get("max_files")
+        if isinstance(max_files, int) and not isinstance(max_files, bool):
+            config.max_files = max(1, min(MAX_FILE_LIMIT, max_files))
+        elif max_files is not None:
+            config.unknown_keys.append("scan.max_files (invalid type)")
         for key in scan:
-            if key not in {"timeout_seconds", "max_projects"}:
+            if key not in {"timeout_seconds", "max_projects", "max_files"}:
                 config.unknown_keys.append(f"scan.{key}")
 
     for key in data:

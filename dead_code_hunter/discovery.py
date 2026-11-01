@@ -17,8 +17,9 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
+from .config import DEFAULT_MAX_FILES
 from .models import ProjectInfo, normalize_path
 from .safety import SKIP_DIRS, is_secret_path
 
@@ -45,47 +46,13 @@ class RepoScan:
     project_limit_reached: bool = False
 
 
-def iter_files(root: Path, max_files: int = 200_000) -> tuple[list[str], dict[str, Any]]:
-    """Walk the repository without following links or entering skipped trees."""
-    files: list[str] = []
-    stats = {"truncated": False, "skipped_secret_files": 0, "skipped_links": 0}
-    for where, dirs, names in os.walk(root, followlinks=False):
-        parent = Path(where)
-        kept: list[str] = []
-        for name in sorted(dirs):
-            candidate = parent / name
-            if name in SKIP_DIRS or is_secret_path(name):
-                stats["skipped_secret_files"] += 1 if is_secret_path(name) else 0
-                continue
-            if candidate.is_symlink():
-                stats["skipped_links"] += 1
-                continue
-            kept.append(name)
-        dirs[:] = kept
-        for name in sorted(names):
-            if is_secret_path(name):
-                stats["skipped_secret_files"] += 1
-                continue
-            candidate = parent / name
-            if candidate.is_symlink():
-                stats["skipped_links"] += 1
-                continue
-            if not candidate.is_file():
-                continue
-            files.append(candidate.relative_to(root).as_posix())
-            if len(files) >= max_files:
-                stats["truncated"] = True
-                return files, stats
-    return files, stats
-
-
-def _dir_has_suffix(files: list[str], directory: str, suffixes: tuple[str, ...]) -> bool:
+def _dir_has_python(files: list[str], directory: str) -> bool:
+    """True when ``directory`` or any descendant contains a ``.py`` file."""
     prefix = "" if directory in ("", ".") else f"{directory}/"
     for path in files:
-        if prefix and not path.startswith(prefix):
+        if not path.endswith(".py"):
             continue
-        remainder = path[len(prefix):]
-        if "/" not in remainder and remainder.endswith(suffixes):
+        if not prefix or path.startswith(prefix):
             return True
     return False
 
@@ -163,9 +130,9 @@ class Discovery:
         return best
 
 
-def discover(root: Path, max_projects: int = 64) -> Discovery:
+def discover(root: Path, max_projects: int = 64, max_files: int = DEFAULT_MAX_FILES) -> Discovery:
     root = root.resolve()
-    files, stats = iter_files(root)
+    files, stats = iter_files(root, max_files=max_files)
     projects: list[ProjectInfo] = []
 
     # --- Python -------------------------------------------------------------
@@ -179,7 +146,10 @@ def discover(root: Path, max_projects: int = 64) -> Discovery:
     )
     py_projects: list[str] = []
     for directory in py_marker_dirs:
-        if _dir_has_suffix(files, directory, (".py",)):
+        # A marker file defines the project boundary; its sources may live in
+        # any sub-directory (src/ layout, app/, packages/...), so Python files
+        # deeper in the tree count (PY-4).
+        if _dir_has_python(files, directory):
             py_projects.append(directory)
     if py_files and not py_projects:
         py_projects.append(".")
@@ -262,7 +232,8 @@ def discover(root: Path, max_projects: int = 64) -> Discovery:
         projects = projects[:max_projects]
         project_limit_reached = True
         skipped.extend(
-            {"project": p.path, "reason": "project limit reached (max_projects)"} for p in dropped
+            {"project": p.path, "langs": ",".join(p.langs), "reason": "project limit reached (max_projects)"}
+            for p in dropped
         )
 
     file_index: dict[str, list[str]] = {"python": [], "js": [], "dart": []}
@@ -280,6 +251,7 @@ def discover(root: Path, max_projects: int = 64) -> Discovery:
         meta={
             "skipped_secret_files": stats["skipped_secret_files"],
             "skipped_links": stats["skipped_links"],
+            "max_files": stats.get("max_files"),
         },
         skipped=skipped,
         file_index=file_index,
@@ -287,8 +259,40 @@ def discover(root: Path, max_projects: int = 64) -> Discovery:
     return discovery
 
 
-def iter_source_files(root: Path, lang: str) -> Iterator[Path]:
-    """Yield source files of one language, skipping secrets and dependency trees."""
-    for rel in iter_files(root)[0]:
-        if rel.endswith(SOURCE_SUFFIXES[lang]):
-            yield root / rel
+def iter_files(root: Path, max_files: int = DEFAULT_MAX_FILES) -> tuple[list[str], dict[str, Any]]:
+    """Walk the repository without following links or entering skipped trees."""
+    files: list[str] = []
+    stats: dict[str, Any] = {
+        "truncated": False,
+        "skipped_secret_files": 0,
+        "skipped_links": 0,
+        "max_files": max_files,
+    }
+    for where, dirs, names in os.walk(root, followlinks=False):
+        parent = Path(where)
+        kept: list[str] = []
+        for name in sorted(dirs):
+            candidate = parent / name
+            if name in SKIP_DIRS or is_secret_path(name):
+                stats["skipped_secret_files"] += 1 if is_secret_path(name) else 0
+                continue
+            if candidate.is_symlink():
+                stats["skipped_links"] += 1
+                continue
+            kept.append(name)
+        dirs[:] = kept
+        for name in sorted(names):
+            if is_secret_path(name):
+                stats["skipped_secret_files"] += 1
+                continue
+            candidate = parent / name
+            if candidate.is_symlink():
+                stats["skipped_links"] += 1
+                continue
+            if not candidate.is_file():
+                continue
+            files.append(candidate.relative_to(root).as_posix())
+            if len(files) >= max_files:
+                stats["truncated"] = True
+                return files, stats
+    return files, stats

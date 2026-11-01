@@ -19,16 +19,39 @@ python -m dead_code_hunter scan --repo C:\path\to\repo
 # Machine-readable output on stdout
 python -m dead_code_hunter scan --repo . --no-write --format json
 
+# Limit the reported findings to a subtree (analysis stays repository-wide)
+python -m dead_code_hunter scan --repo . --scope src/api
+
+# Fail on any incomplete analysis (PARTIAL, FAILED, skipped or unmatched scope)
+python -m dead_code_hunter scan --repo . --strict
+
 # Where the reports went
 python -m dead_code_hunter scan --repo . --print-report-path
 ```
+
+### What `--scope` means
+
+Scope selects **what is reported** and **which projects run** — it never
+narrows the reference index:
+
+* the reference index always covers the whole repository, so a symbol used
+  outside the scope is still `RETAIN` (spec R3);
+* a scope nested inside a project runs the *parent* project, so sibling
+  modules remain visible;
+* a scope that matches no file, or points outside the repository, is an
+  explicit coverage `FAILED` entry plus a `--strict` failure — never a
+  silently clean scan.
 
 Reports are written to `%LOCALAPPDATA%\dead-code-hunter\<repo-id>\<scan_id>\report.json|report.md`
 (override the base directory with `--reports-dir` or `DEAD_CODE_HUNTER_REPORTS`).
 A base directory that resolves inside the scanned repository is refused.
 
-Exit codes: `0` ok · `1` error or (`--strict`) a failed analyzer · `2` the
+Exit codes: `0` ok · `1` error or (`--strict`) an incomplete analysis · `2` the
 repository changed during the scan.
+
+`--strict` fails on `PARTIAL` as well as `FAILED`, on a project that was never
+analysed, on a truncated file index, on a project dropped by `max_projects`, and
+on a scope that matched nothing.
 
 ## What it needs
 
@@ -95,10 +118,20 @@ evidence axes and the reference outcome of a finding. Any adapter that returns
 
 `COMPLETE` means the declared scope and tool ran fully. `PARTIAL` means the
 analysis ran but has a named gap (failing file, unresolved import, missing
-`node_modules`, uncovered entrypoint, DP-5 condition). `FAILED` means the tool
-did not produce a trustworthy result. `NOT_APPLICABLE` means the analyzer has
-nothing to do in this project. Every gap is named in `coverage[].reason`, and
-`inherited: true` marks a project whose coverage comes from an ancestor run.
+`node_modules`, uncovered entrypoint, DP-5 condition, truncated file index).
+`FAILED` means the tool did not produce a trustworthy result.
+`NOT_APPLICABLE` means the analyzer has nothing to do in this project. Every gap
+is named in `coverage[].reason`, and `inherited: true` marks a project whose
+coverage comes from an ancestor run.
+
+Two discovery-level gaps get their own rows instead of being folded into a
+tool's verdict: projects dropped by `max_projects` appear as `FAILED` entries
+with `tool: "<skipped>"`, and a scope that resolved to nothing appears as
+`FAILED` with `tool: "<scope>"`.
+
+Merging corroborating findings never upgrades coverage: if any contributing
+analyzer was `PARTIAL` or `FAILED`, the merged finding inherits the weakest
+verdict (a clean tool cannot vouch for an unclean one).
 
 ## Repository configuration (read-only)
 
@@ -113,6 +146,7 @@ medium = ["reporting"]
 [scan]
 timeout_seconds = 180
 max_projects = 64
+max_files = 200000        # truncation downgrades coverage to PARTIAL
 ```
 
 `.dead-code/ignore`
@@ -145,23 +179,30 @@ together with the matching rule.
 python -m pytest tests -q
 ```
 
-348 tests. Fixtures live in `tests/fixtures_repo.py`; each one declares the raw
-output the real tool produces, so the tests check parsing and judgement instead
-of self-consistency. Analyzer stubs (`tests/stubs/fake_tool.py`) are used only
-where the tool is not installed on the host; the tests that use real `ruff` and
-real `dart analyze` skip when those tools are absent.
+Fixtures live in `tests/fixtures_repo.py`; each one declares the raw output the
+real tool produces, so the tests check parsing and judgement instead of
+self-consistency. Analyzer stubs (`tests/stubs/fake_tool.py`) are used only
+where the tool is not installed on the host.
+
+`tests/test_integration_real_tools.py` runs **real** `ruff`, `vulture` and
+`dart analyze` on fixtures and **skips** (never passes) when a tool is absent.
+`knip` is verified to stay unrun without a local `node_modules/.bin/knip`.
 
 ## M1 fixtures
 
 Python: F-PY-01…F-PY-14 · JS/TS: F-JS-01…F-JS-12 · Dart: F-DT-01…F-DT-07 ·
 cross-cutting: F-X-01, F-X-02a, F-X-04, F-X-05.
+`tests/test_remediation.py` holds the post-review regression suite.
 
 ## Known limitations (M1)
 
 * No snapshot/sandbox: analyzers run on the real checkout. `dart analyze` may
   create `.dart_tool/`; the git-integrity check reports it.
-* `vulture` and `knip` are not installed on this development host, so their
-  integration is verified against faithful stubs, not the live binaries.
+* `knip` is not installed on this development host; its integration is verified
+  against faithful stubs plus a test proving it is never taken from `PATH`.
+  `ruff`, `vulture` and `dart analyze` are exercised as real binaries.
+* Git integrity uses `git status`, which does not report `.gitignore`d paths.
+  Every report states this (`git_integrity.ignored_files_tracked: false`).
 * Reference analysis for Python and JS is syntactic (AST/regex) plus known
   dynamic patterns. Unknown dynamic wiring can only produce `REVIEW_REQUIRED`
   or `RETAIN`, never `CANDIDATE` — but it can also hide real dead code.
@@ -171,12 +212,23 @@ cross-cutting: F-X-01, F-X-02a, F-X-04, F-X-05.
 * Dart `package:` URIs to third-party packages are not "unresolved": only
   repository-internal URIs count as analysis gaps.
 
-### Recording decision: `__all__` vs. published surface
+### Recording decision: published surface (`__all__`, `__init__.py`, CLI)
 
-The specification assigns `__all__` names and `__init__.py` re-exports the
-contract `INTERNAL_SHARED` (PY-1, F-PY-04 → `REVIEW_REQUIRED`) while also saying
-that symbols exposed through a published package's entrypoints are `PUBLIC`
-(→ `PROTECTED`, F-PY-14). The implementation resolves this by treating
-`__all__` entries as `INTERNAL_SHARED`, and `__init__.py` re-exports *without*
-`__all__` as `PUBLIC` when the package is a distributed library without
-application entrypoints. Both resolutions are conservative (never `CANDIDATE`).
+`__init__.py` re-exports and `__all__` names are `PUBLIC` only when the package
+really is the published surface: the project declares `[project]`, the
+directory is a detected top-level package, and its name matches the declared
+distribution (PEP 503-normalised, or a token of it — `mylib14` in
+`dch-mylib14`). Everything else is `INTERNAL_SHARED` → `REVIEW_REQUIRED`.
+
+Consequences:
+
+* F-PY-14 (`mylib14` / `dch-mylib14`) → `PROTECTED`.
+* F-PY-03b (`app` / `dch-fpy03b`) → `INTERNAL_SHARED` → `REVIEW_REQUIRED`,
+  because the package name is unrelated to the distribution name.
+* Names with a leading underscore are never `PUBLIC`, wherever they are
+  re-exported.
+* Shipping a console script (`[project.scripts]`) is an *entrypoint*, not
+  evidence that the project is an application: a distributed library that also
+  ships a CLI keeps its library surface.
+
+Both resolutions stay conservative: no path in this area can reach `CANDIDATE`.

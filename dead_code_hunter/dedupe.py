@@ -13,11 +13,13 @@ from .models import Category, Confidence, Contract, Coverage, Finding, Impact, R
 _CONFIDENCE_RANK = {Confidence.LOW: 0, Confidence.MEDIUM: 1, Confidence.HIGH: 2}
 _CONTRACT_RANK = {Contract.NONE: 0, Contract.INTERNAL_SHARED: 1, Contract.PUBLIC: 2}
 _IMPACT_RANK = {Impact.LOW: 0, Impact.MEDIUM: 1, Impact.HIGH: 2, Impact.CRITICAL: 3}
-_COVERAGE_RANK = {
-    Coverage.FAILED: 0,
-    Coverage.PARTIAL: 1,
-    Coverage.NOT_APPLICABLE: 2,
-    Coverage.COMPLETE: 3,
+#: Coverage is merged by *severity*: the weakest verdict wins.  A tool that
+#: finished cleanly cannot vouch for one that did not (spec R4, P1).
+_COVERAGE_SEVERITY = {
+    Coverage.COMPLETE: 0,
+    Coverage.NOT_APPLICABLE: 1,
+    Coverage.PARTIAL: 2,
+    Coverage.FAILED: 3,
 }
 _REFERENCE_RANK = {ReferenceKind.NONE: 0, ReferenceKind.UNRESOLVED: 1, ReferenceKind.ACTIVE: 2}
 
@@ -75,7 +77,7 @@ def merge(group: list[Finding]) -> Finding:
         merged.confidence = _best(merged.confidence, finding.confidence, _CONFIDENCE_RANK)
         merged.contract = _best(merged.contract, finding.contract, _CONTRACT_RANK)
         merged.impact = _best(merged.impact, finding.impact, _IMPACT_RANK)
-        merged.coverage = _best(merged.coverage, finding.coverage, _COVERAGE_RANK)
+        merged.coverage = _best(merged.coverage, finding.coverage, _COVERAGE_SEVERITY)
         merged.reference = _best(merged.reference, finding.reference, _REFERENCE_RANK)
 
     tools = sorted({f.tool for f in ordered})
@@ -84,6 +86,10 @@ def merge(group: list[Finding]) -> Finding:
         merged.signals = sorted(set(merged.signals) | {f"corroborated by: {', '.join(tools[1:])}"})
     if any(f.category is Category.DEAD_CODE for f in ordered):
         merged.category = Category.DEAD_CODE
+    # Identity survives the merge: approvals, reports and re-scans all key on it.
+    merged.scan_id = next((f.scan_id for f in ordered if f.scan_id), "")
+    merged.fingerprint = merged.compute_fingerprint()
+    merged.id = merged.compute_id()
     return merged
 
 

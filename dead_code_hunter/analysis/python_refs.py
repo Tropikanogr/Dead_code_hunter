@@ -23,6 +23,7 @@ from ..models import (
     Impact,
     ReferenceKind,
     is_common_word,
+    normalize_path,
 )
 from .sources import SourceCache
 
@@ -68,7 +69,10 @@ class PythonFacts:
     main_modules: set[str] = field(default_factory=set)
     console_scripts: dict[str, tuple[str, str]] = field(default_factory=dict)
     distributed_projects: set[str] = field(default_factory=set)
-    app_projects: set[str] = field(default_factory=set)
+    #: project -> repo-relative directories that hold its published top-level packages.
+    package_roots: dict[str, set[str]] = field(default_factory=dict)
+    #: project -> distribution name declared in pyproject.toml
+    distribution_names: dict[str, str] = field(default_factory=dict)
     test_files: set[str] = field(default_factory=set)
     parse_errors: dict[str, str] = field(default_factory=dict)
     parse_error_files: list[str] = field(default_factory=list)
@@ -273,32 +277,121 @@ def _load_project_metadata(root: Path, project_roots: list[str], facts: PythonFa
     for project in sorted(set(project_roots)):
         base = root if project in (".", "") else root / project
         pyproject = base / "pyproject.toml"
-        if not pyproject.is_file():
-            continue
-        try:
-            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
-            continue
+        data: dict = {}
+        if pyproject.is_file():
+            try:
+                data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+                data = {}
+
         project_table = data.get("project")
         scripts: dict[str, str] = {}
         if isinstance(project_table, dict):
             facts.distributed_projects.add(project)
+            declared_name = project_table.get("name")
+            if isinstance(declared_name, str) and declared_name.strip():
+                facts.distribution_names[project] = declared_name.strip()
             for key in ("scripts", "gui-scripts"):
                 table = project_table.get(key)
                 if isinstance(table, dict):
                     scripts.update({k: v for k, v in table.items() if isinstance(v, str)})
-        poetry = data.get("tool", {})
-        if isinstance(poetry, dict):
-            poetry_scripts = poetry.get("poetry", {}).get("scripts") if isinstance(poetry.get("poetry"), dict) else None
-            if isinstance(poetry_scripts, dict):
-                scripts.update({k: v for k, v in poetry_scripts.items() if isinstance(v, str)})
-                facts.distributed_projects.add(project)
-        if scripts:
-            facts.app_projects.add(project)
-            for name, target in scripts.items():
-                if ":" in target:
-                    module, func = target.split(":", 1)
-                    facts.console_scripts[name] = (module.strip(), func.strip().split(".")[-1])
+        poetry_table = data.get("tool", {})
+        poetry_scripts = (
+            poetry_table.get("poetry", {}).get("scripts")
+            if isinstance(poetry_table, dict) and isinstance(poetry_table.get("poetry"), dict)
+            else None
+        )
+        if isinstance(poetry_scripts, dict):
+            scripts.update({k: v for k, v in poetry_scripts.items() if isinstance(v, str)})
+            facts.distributed_projects.add(project)
+
+        # A console script is an *entrypoint* of the package, not evidence that
+        # the package is an application: a distributed library may ship a CLI.
+        for _name, target in scripts.items():
+            # ``module:func`` or ``module:obj.func`` (object attributes are common).
+            if ":" not in target:
+                continue
+            module, func = target.split(":", 1)
+            facts.console_scripts[_name] = (module.strip(), func.strip().split(".")[-1])
+
+        roots = facts.package_roots.setdefault(project, set())
+        for key in ("packages", "py-modules"):
+            declared = project_table.get(key) if isinstance(project_table, dict) else None
+            if isinstance(declared, list):
+                for entry in declared:
+                    if isinstance(entry, str) and entry:
+                        roots.add(normalize_path(entry.replace(".", "/").replace("*", "").rstrip("/")))
+        # Default layouts: flat (packages beside pyproject.toml) and src/.
+        roots.update(_detect_package_roots(base, project, facts))
+
+
+def _detect_package_roots(base: Path, project: str, facts: PythonFacts) -> set[str]:
+    """Top-level importable package directories of a Python project."""
+    found: set[str] = set()
+    prefix = "" if project in (".", "") else project
+    for file, _module in facts.file_modules.items():
+        if prefix and not (file == prefix or file.startswith(f"{prefix}/")):
+            continue
+        relative = file[len(prefix):].lstrip("/") if prefix else file
+        parts = relative.split("/")
+        if len(parts) >= 2 and parts[0] == "src":
+            if len(parts) >= 3 and parts[2] == "__init__.py":
+                found.add(normalize_path(f"{prefix}/src/{parts[1]}" if prefix else f"src/{parts[1]}"))
+            continue
+        if len(parts) >= 2 and parts[1] == "__init__.py":
+            found.add(normalize_path(f"{prefix}/{parts[0]}" if prefix else parts[0]))
+    return found
+
+
+def _is_init_public_surface(init_file: str, project: str, facts: PythonFacts) -> bool:
+    """True when ``__init__.py`` is the public surface of a distributed package.
+
+    Conservative by design.  The package counts as the published surface only
+    when *all* of these hold (spec P3/P5, "when the public surface is
+    uncertain, stay conservative"):
+
+    1. the project declares ``[project]`` in its own ``pyproject.toml``;
+    2. the ``__init__.py`` belongs to a detected top-level package directory;
+    3. that directory's name is a token of the declared distribution name
+       (``mylib14`` vs ``dch-mylib14``), i.e. the package really is what the
+       distribution ships.
+
+    A package whose name does not appear in the distribution name (a typical
+    application, e.g. ``app`` shipped as ``myapp``) keeps the weaker
+    INTERNAL_SHARED verdict: REVIEW_REQUIRED, never CANDIDATE, never PROTECTED.
+    """
+    if project not in facts.distributed_projects:
+        return False
+    package_dir = str(Path(init_file).parent).replace("\\", "/")
+    if package_dir in ("", "."):
+        return False
+    roots = facts.package_roots.get(project) or set()
+    if normalize_path(package_dir) not in {normalize_path(root) for root in roots}:
+        return False
+    distribution = facts.distribution_names.get(project)
+    if not distribution:
+        return False
+    package_name = normalize_path(package_dir).rsplit("/", 1)[-1]
+
+    def tokens(value: str) -> list[str]:
+        return [part for part in re.split(r"[-_.]+", value.lower()) if part]
+
+    normalise = lambda value: "-".join(tokens(value))  # noqa: E731
+    package_name = package_name.lower()
+    # Exact PEP 503-normalised match (acme_orders == acme-orders), or the
+    # package is one of the distribution's name tokens (mylib14 in dch-mylib14).
+    return normalise(package_name) == normalise(distribution) or package_name in tokens(
+        distribution
+    )
+
+
+def _is_private_name(symbol: str | None) -> bool:
+    """Leading-underscore names are private by convention (dunders excluded)."""
+    if not symbol:
+        return False
+    if symbol.startswith("__") and symbol.endswith("__"):
+        return False
+    return symbol.startswith("_")
 
 
 def _decorator_is_route(qualified: str) -> bool:
@@ -385,21 +478,28 @@ def enrich(finding: Finding, facts: PythonFacts, coverage: Coverage, project: st
         finding.contract_reasons.append("module is executed as a package entrypoint (__main__.py)")
 
     exported = facts.all_exports.get(finding.file, set())
+    init_surface = finding.file.endswith("__init__.py")
     if symbol and symbol in exported and finding.contract is Contract.NONE:
-        finding.contract = Contract.INTERNAL_SHARED
-        finding.contract_reasons.append(f"symbol is listed in __all__ of {finding.file}")
+        # A name published from a top-level package of a distributed library is
+        # part of its public API, whether or not __all__ is used to list it.
+        if _is_init_public_surface(finding.file, project, facts) and not _is_private_name(symbol):
+            finding.contract = Contract.PUBLIC
+            finding.contract_reasons.append(
+                f"published in __all__ of the public package {finding.file}"
+            )
+        else:
+            finding.contract = Contract.INTERNAL_SHARED
+            finding.contract_reasons.append(f"symbol is listed in __all__ of {finding.file}")
 
-    if finding.file.endswith("__init__.py") and finding.contract is Contract.NONE:
-        package_dir = str(Path(finding.file).parent).replace("\\", "/")
-        package_parent = str(Path(package_dir).parent).replace("\\", "/")
-        if package_dir in ("", "."):
-            package_dir = "."
-        if package_parent in ("", "."):
-            package_parent = "."
-        top_level = package_parent in (".", project) or package_parent == f"{project}/src"
-        distributed = project in facts.distributed_projects
-        is_app = project in facts.app_projects
-        if top_level and distributed and not is_app:
+    if init_surface and finding.contract is Contract.NONE:
+        if _is_private_name(symbol):
+            # Private by convention: re-exporting it does not publish it, but it
+            # is still a shared internal surface -> conservative INTERNAL_SHARED.
+            finding.contract = Contract.INTERNAL_SHARED
+            finding.contract_reasons.append(
+                f"private name re-exported from {finding.file}; not part of the public surface"
+            )
+        elif _is_init_public_surface(finding.file, project, facts):
             finding.contract = Contract.PUBLIC
             finding.contract_reasons.append(
                 "name re-exported from a top-level package of a distributed library"

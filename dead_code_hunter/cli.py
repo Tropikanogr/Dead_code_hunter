@@ -100,10 +100,12 @@ def main(argv: list[str] | None = None) -> int:
 
     report = outcome.report
     exit_code = outcome.exit_code
-    if args.strict and any(
-        entry.get("coverage") == "FAILED" for entry in report.get("coverage", [])
-    ):
-        exit_code = exit_code or EXIT_ERROR
+    if args.strict:
+        gaps = strict_gaps(report)
+        if gaps:
+            exit_code = exit_code or EXIT_ERROR
+            for gap in gaps[:10]:
+                print(f"strict: {gap}", file=sys.stderr)
 
     if args.print_report_path:
         if outcome.json_path:
@@ -119,6 +121,61 @@ def main(argv: list[str] | None = None) -> int:
     if outcome.report_error:
         print(f"warning: {outcome.report_error}", file=sys.stderr)
     return exit_code
+
+
+#: Coverage verdicts that mean "this analysis is not trustworthy enough".
+STRICT_FAILING_COVERAGE = frozenset({"PARTIAL", "FAILED"})
+
+
+def strict_gaps(report: dict) -> list[str]:
+    """Everything that makes a scan incomplete (spec P1, `--strict`).
+
+    ``--strict`` fails on PARTIAL as well as FAILED, on any project that was
+    never analysed, on a scope that matched nothing, and on a truncated file
+    index.  Absence of coverage rows counts as a failure too: a language with
+    no rows has no evidence, which is not the same as "nothing found".
+    """
+    gaps: list[str] = []
+    coverage = report.get("coverage") or []
+    for entry in coverage:
+        status = entry.get("coverage")
+        if status in STRICT_FAILING_COVERAGE:
+            gaps.append(
+                f"{entry.get('project')} [{entry.get('lang')}] {entry.get('tool')}: "
+                f"{status} - {entry.get('reason')}"
+            )
+        elif status not in {"COMPLETE", "NOT_APPLICABLE"}:
+            gaps.append(
+                f"{entry.get('project')} [{entry.get('lang')}] {entry.get('tool')}: "
+                f"unknown coverage {status!r}"
+            )
+    if not coverage:
+        gaps.append("no coverage recorded at all")
+
+    projects = report.get("projects") or []
+    langs = (report.get("scope") or {}).get("langs") or []
+    covered = {(entry.get("project"), entry.get("lang")) for entry in coverage}
+    for project in projects:
+        for lang in project.get("langs") or []:
+            if lang not in langs:
+                continue
+            if (project.get("path"), lang) not in covered:
+                gaps.append(
+                    f"{project.get('path')} [{lang}]: no coverage entry (never analysed)"
+                )
+
+    discovery = report.get("discovery") or {}
+    if discovery.get("truncated"):
+        gaps.append("file index truncated (max_files reached)")
+    for skipped in discovery.get("skipped_projects") or []:
+        gaps.append(f"project skipped: {skipped.get('project')} ({skipped.get('reason')})")
+
+    scope = report.get("scope") or {}
+    for term in scope.get("unmatched") or []:
+        gaps.append(f"scope matched no files: {term}")
+    for term in scope.get("outside_root") or []:
+        gaps.append(f"scope outside the repository: {term}")
+    return gaps
 
 
 def _print_summary(report: dict, outcome) -> None:

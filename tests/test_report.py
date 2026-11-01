@@ -65,7 +65,8 @@ def test_report_has_every_documented_field(tmp_path):
     report = out.report
     assert REPORT_FIELDS <= set(report)
     assert set(report["revision"]) == {"head", "dirty", "dirty_files"}
-    assert set(report["scope"]) == {"paths", "langs"}
+    assert {"paths", "langs"} <= set(report["scope"])
+    assert {"requested", "reported", "unmatched", "outside_root"} <= set(report["scope"])
     assert set(report["isolation"]) >= {
         "os_sandbox",
         "network_blocked",

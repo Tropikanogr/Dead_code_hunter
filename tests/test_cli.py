@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from dead_code_hunter import cli
 
 from .fixtures_repo import pyproject
@@ -60,8 +62,26 @@ def test_reports_go_to_the_reports_directory(tmp_path, capsys):
 
 def test_strict_mode_fails_when_a_tool_is_missing(tmp_path):
     repo = write_repo(tmp_path)
-    # `vulture` is not installed on PATH in this environment: coverage FAILED.
-    code = cli.main(["scan", "--repo", str(repo), "--no-write", "--strict"])
+    # Simulate an absent vulture instead of assuming anything about this host.
+    from dead_code_hunter import cli
+    import dead_code_hunter.scanner as scanner_module
+    from dead_code_hunter.tools import ToolOverrides
+
+    overrides = ToolOverrides()
+    overrides.disabled.add("vulture")
+    original = scanner_module.ScanOptions
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(
+        cli,
+        "ScanOptions",
+        lambda **kwargs: original(**{**kwargs, "overrides": overrides, "write_reports": False}),
+        raising=True,
+    )
+    try:
+        code = cli.main(["scan", "--repo", str(repo), "--no-write", "--strict"])
+    finally:
+        monkey.undo()
     assert code == 1
 
 

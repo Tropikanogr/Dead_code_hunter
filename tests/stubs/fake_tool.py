@@ -28,6 +28,10 @@ def main() -> int:
     if "--version" in analyzer_args:
         sys.stdout.write(str(config.get("version", "9.9.9")) + "\n")
         return 0
+    recorded = entry.get("record_cwd") or config.get("record_cwd")
+    if recorded:
+        Path(recorded).parent.mkdir(parents=True, exist_ok=True)
+        Path(recorded).write_text(cwd + "\n", encoding="utf-8")
     stdout = str(entry.get("stdout", "")).replace("{cwd}", cwd).replace("{root}", str(config_path.parent))
     sys.stdout.write(stdout)
     sys.stderr.write(str(entry.get("stderr", "")))

@@ -120,24 +120,34 @@ class VultureAdapter(Adapter):
             return base
         outcome = parse_vulture(result.stdout)
         failed_files = _failed_files(result.stderr) + _failed_files(result.stdout)
-        if result.exit_code == 0:
-            base.coverage = Coverage.COMPLETE
-            base.coverage_reason = "vulture exit 0 (no unused code reported)"
-        elif result.exit_code == 3:
-            base.coverage = Coverage.COMPLETE
-            base.coverage_reason = f"vulture exit 3 (unused code reported); {len(outcome.items)} finding(s)"
-        elif result.exit_code == 1:
-            base.coverage = Coverage.PARTIAL
-            base.coverage_reason = "vulture exit 1 (analysis error), failed file(s): " + (
-                ", ".join(sorted(set(failed_files))[:5]) or "unknown (tool did not name them)"
-            )
-        else:
+        if result.exit_code not in (0, 1, 3):
             base.coverage = Coverage.FAILED
             base.coverage_reason = (
                 f"vulture exit {result.exit_code}: {result.stderr.strip()[:300] or 'no diagnostics'}"
             )
             base.diagnostics = {"stderr": result.stderr[:2000]}
             return base
+        if failed_files:
+            # Vulture reports unparsable files on stderr but still exits 3 when
+            # it also found something else, so the exit code alone cannot be
+            # trusted: any named failure makes the run PARTIAL (spec PY-2,
+            # BUG-03).  Verified against vulture 2.14 on this host.
+            base.coverage = Coverage.PARTIAL
+            base.coverage_reason = (
+                f"vulture exit {result.exit_code} with unparsable file(s): "
+                + ", ".join(sorted(set(failed_files))[:5])
+            )
+        elif result.exit_code == 1:
+            base.coverage = Coverage.PARTIAL
+            base.coverage_reason = "vulture exit 1 (analysis error; no file named in the output)"
+        elif result.exit_code == 0:
+            base.coverage = Coverage.COMPLETE
+            base.coverage_reason = "vulture exit 0 (no unused code reported)"
+        else:
+            base.coverage = Coverage.COMPLETE
+            base.coverage_reason = (
+                f"vulture exit 3 (unused code reported); {len(outcome.items)} finding(s)"
+            )
         base.diagnostics = {
             "warnings": outcome.warnings[:20],
             "failed_files": sorted(set(failed_files)),
@@ -161,15 +171,24 @@ class VultureAdapter(Adapter):
         return base
 
 
+_VULTURE_PARSE_ERROR = re.compile(
+    r"^\s*(?P<path>[^\s:\"']+\.py):\d+:\s*(?:invalid syntax|error|"
+    r"cannot (?:parse|compile)|SyntaxError)",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
 def _failed_files(text: str) -> list[str]:
+    """Files vulture could not analyse.
+
+    Vulture names them as ``path.py:line: invalid syntax at "..."`` on stderr.
+    Only diagnostic lines count: a normal finding line must never be mistaken
+    for a failed file.
+    """
     found: list[str] = []
-    patterns = (
-        r'File "([^"]+\.py)"',
-        r"(?P<path>[A-Za-z]:\\[^:\n\"']+\.py)(?=:\d+)",
-        r"(?P<path>[^\s:\"']+\.py)(?=:\d+)",
-    )
-    for pattern in patterns:
+    for pattern in (r'File "([^"]+\.py)"', r"(?P<path>[A-Za-z]:\\[^:\n\"']+\.py)(?=:\d+:\s*error)"):
         for match in re.finditer(pattern, text, re.MULTILINE):
-            value = match.groupdict().get("path") or match.group(1)
-            found.append(value)
-    return [f for f in found if f]
+            found.append(match.groupdict().get("path") or match.group(1))
+    for match in _VULTURE_PARSE_ERROR.finditer(text):
+        found.append(match.group("path"))
+    return [value for value in found if value]

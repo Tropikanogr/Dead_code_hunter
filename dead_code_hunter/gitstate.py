@@ -110,4 +110,13 @@ class GitIntegrity:
             "changed": self.changed,
             "changed_files": self.changed_files,
             "verifiable": self.verifiable,
+            # Honest scope limitation: `git status --porcelain` ignores
+            # .gitignore'd paths, so a write into an ignored file is invisible
+            # to this check (it is still reported as unverifiable coverage).
+            "ignored_files_tracked": False,
+            "ignored_files_note": (
+                "git status does not report files matched by .gitignore "
+                "(.dart_tool/, build outputs, caches); writes into those paths are "
+                "outside the integrity check."
+            ),
         }

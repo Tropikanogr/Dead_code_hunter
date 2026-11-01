@@ -474,10 +474,13 @@ TOOL_OUTPUT: dict[str, dict[str, dict]] = {
     },
     "F-PY-13": {
         "ruff": {"exit": 0, "stdout": "[]"},
+        # Byte-for-byte vulture 2.14 behaviour (verified on this host): the
+        # parse failure goes to stderr as path:line: invalid syntax at "...",
+        # and no findings are printed, so the exit code is 1.
         "vulture": {
             "exit": 1,
             "stdout": "",
-            "stderr": "Error: invalid syntax in app/broken.py:1\n",
+            "stderr": 'app/broken.py:1: invalid syntax at "def broken(:"\n',
         },
     },
     "F-PY-14": {
