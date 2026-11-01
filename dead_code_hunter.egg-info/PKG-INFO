@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: dead-code-hunter
+Version: 1.1.0
+Summary: Read-only dead code scanner with evidence-based classification (M1: scanner correctness).
+Requires-Python: >=3.11
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
